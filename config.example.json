@@ -12,6 +12,11 @@
     "total": 5,
     "threads": 1,
     "thread_start_interval": 0.8,
+    "max_task_retries": 2,
+    "retry_backoff_seconds": 2,
+    "email_pool_size": 10,
+    "email_pool_workers": 1,
+    "email_pool_warmup_seconds": 3,
     "otp_timeout": 60,
     "otp_fast_poll_seconds": 10,
     "otp_fast_poll_interval": 0.8,
@@ -27,7 +32,7 @@
   "output": {
     "accounts_file": "data/accounts.jsonl",
     "failed_file": "data/failed.jsonl",
+    "progress_db": "data/progress.db",
     "log_file": "logs/register.log"
   }
 }
-

@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import json
+import queue
 import random
 import re
 import string
+import threading
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes, message_from_string, policy
@@ -210,6 +212,11 @@ domain_index = 0
 provider_index = 0
 cloudmail_token_lock = Lock()
 cloudmail_token_cache: dict[str, tuple[str, float]] = {}
+email_pool_lock = Lock()
+email_pool_stop = threading.Event()
+email_pool_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+email_pool_threads: list[threading.Thread] = []
+email_pool_config: dict[str, Any] | None = None
 
 
 def _config(mail_config: dict) -> dict:
@@ -1497,7 +1504,7 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
-def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
+def _create_mailbox_direct(mail_config: dict, username: str | None = None) -> dict:
     enabled = _enabled_entries(mail_config)
     tried: set[str] = set()
     last_error = ""
@@ -1517,6 +1524,14 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
         finally:
             provider.close()
     raise RuntimeError(last_error or "所有启用的邮箱提供商均无法创建邮箱")
+
+
+def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
+    if username is None:
+        pooled = get_pooled_mailbox()
+        if pooled:
+            return pooled
+    return _create_mailbox_direct(mail_config, username)
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
@@ -1553,6 +1568,87 @@ def release_mailbox(mailbox: dict) -> None:
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(str(mailbox.get("address") or ""))
+
+
+def get_pooled_mailbox() -> dict[str, Any] | None:
+    try:
+        return email_pool_queue.get_nowait()
+    except queue.Empty:
+        return None
+
+
+def email_pool_size() -> int:
+    return email_pool_queue.qsize()
+
+
+def clear_email_pool() -> None:
+    while True:
+        try:
+            email_pool_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+def stop_email_pool() -> None:
+    email_pool_stop.set()
+    for thread in list(email_pool_threads):
+        thread.join(timeout=1)
+    email_pool_threads.clear()
+
+
+def start_email_pool(
+    mail_config: dict,
+    target_size: int,
+    workers: int = 1,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Pre-create CloudMail mailboxes while preserving the existing provider API."""
+    global email_pool_config
+    target_size = max(0, int(target_size or 0))
+    if target_size <= 0:
+        stop_email_pool()
+        clear_email_pool()
+        return
+    enabled = _enabled_entries(mail_config)
+    if len(enabled) != 1 or enabled[0].get("type") != "cloudmail_gen":
+        if log_callback:
+            log_callback("email pool disabled because the active provider is not a single cloudmail_gen")
+        return
+    with email_pool_lock:
+        email_pool_config = dict(mail_config)
+        email_pool_stop.clear()
+        live = [thread for thread in email_pool_threads if thread.is_alive()]
+        email_pool_threads[:] = live
+        wanted = max(1, min(max(1, int(workers or 1)), target_size))
+        for _ in range(max(0, wanted - len(email_pool_threads))):
+            thread = threading.Thread(
+                target=_email_pool_worker,
+                args=(target_size, log_callback),
+                daemon=True,
+                name=f"cloudmail-email-pool-{len(email_pool_threads) + 1}",
+            )
+            email_pool_threads.append(thread)
+            thread.start()
+
+
+def _email_pool_worker(target_size: int, log_callback: Callable[[str], None] | None = None) -> None:
+    while not email_pool_stop.is_set():
+        try:
+            if email_pool_queue.qsize() >= target_size:
+                time.sleep(0.5)
+                continue
+            config_snapshot = dict(email_pool_config or {})
+            if not config_snapshot:
+                time.sleep(0.5)
+                continue
+            mailbox = _create_mailbox_direct(config_snapshot)
+            email_pool_queue.put(mailbox)
+            if log_callback:
+                log_callback(f"prepared {mailbox.get('address')} size={email_pool_queue.qsize()}")
+        except Exception as error:
+            if log_callback:
+                log_callback(f"refill failed: {error}")
+            time.sleep(2)
 
 
 def get_existing_mailbox(mail_config: dict, email: str) -> dict:
