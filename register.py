@@ -344,14 +344,18 @@ class ProgressStore:
             self.conn.execute("UPDATE batches SET updated_at=? WHERE id=?", (now, batch_id))
 
     def complete_if_done(self, batch_id: str) -> None:
-        remaining = self.conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status != 'success'",
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) FROM tasks WHERE batch_id=? GROUP BY status",
             (batch_id,),
-        ).fetchone()[0]
-        if int(remaining) == 0:
-            now = self._now()
-            with self.conn:
-                self.conn.execute("UPDATE batches SET status='completed', updated_at=? WHERE id=?", (now, batch_id))
+        ).fetchall()
+        counts = {str(status): int(count) for status, count in rows}
+        pending = counts.get("pending", 0) + counts.get("running", 0)
+        if pending:
+            return
+        next_status = "completed" if counts.get("failed", 0) == 0 else "failed"
+        now = self._now()
+        with self.conn:
+            self.conn.execute("UPDATE batches SET status=?, updated_at=? WHERE id=?", (next_status, now, batch_id))
 
     def counts(self, batch_id: str) -> dict[str, int]:
         rows = self.conn.execute(
@@ -583,6 +587,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if not batch_id:
             print("[status] no batches")
             return 1
+        store.complete_if_done(batch_id)
         info = store.batch_info(batch_id)
         if not info:
             print(f"[status] batch not found: {batch_id}")
@@ -622,18 +627,27 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as error:
         print(f"[fail] config invalid: {error}")
         return 1
-    try:
-        provider = mail_provider._create_provider(cfg["mail"])  # type: ignore[attr-defined]
+    token_ok = False
+    last_error = ""
+    for attempt in range(1, 4):
         try:
-            if getattr(provider, "name", "") == "cloudmail_gen" and hasattr(provider, "_get_token"):
-                token = provider._get_token()
-                print(f"[ok] CloudMail public token acquired: {str(token)[:6]}...")
-            else:
-                print(f"[skip] live CloudMail token check for provider={getattr(provider, 'name', 'unknown')}")
-        finally:
-            provider.close()
-    except Exception as error:
-        print(f"[fail] CloudMail live check failed: {error}")
+            provider = mail_provider._create_provider(cfg["mail"])  # type: ignore[attr-defined]
+            try:
+                if getattr(provider, "name", "") == "cloudmail_gen" and hasattr(provider, "_get_token"):
+                    token = provider._get_token()
+                    print(f"[ok] CloudMail public token acquired: {str(token)[:6]}...")
+                else:
+                    print(f"[skip] live CloudMail token check for provider={getattr(provider, 'name', 'unknown')}")
+                token_ok = True
+                break
+            finally:
+                provider.close()
+        except Exception as error:
+            last_error = str(error)
+            print(f"[warn] CloudMail live check attempt {attempt}/3 failed: {last_error}")
+            time.sleep(attempt)
+    if not token_ok:
+        print(f"[fail] CloudMail live check failed: {last_error}")
         ok = False
     if args.create_mailbox:
         try:

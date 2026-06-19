@@ -14,6 +14,25 @@ Fill `config.json` with your local CloudMail and proxy settings. Do not commit
 
 ## Run
 
+Desktop GUI:
+
+```bash
+python gui.py
+```
+
+On Windows you can also double-click:
+
+```text
+start.bat
+start_gui.bat
+start_cli.bat
+```
+
+`start.bat` and `start_gui.bat` open the GUI. `start_cli.bat` opens a small
+command menu for common operations.
+
+CLI:
+
 ```bash
 python register.py run --config config.json
 ```
@@ -43,43 +62,49 @@ Batch progress is stored in `data/progress.db`.
 
 ## Recommended Flow
 
-1. Validate the config:
+1. Open the GUI:
+
+   ```bash
+   python gui.py
+   ```
+
+2. Validate the config:
 
    ```bash
    python register.py doctor
    ```
 
-2. Run one account:
+3. Run one account:
 
    ```bash
    python register.py run --preset smoke
    ```
 
-3. Run a small batch:
+4. Run a small batch:
 
    ```bash
    python register.py run --total 5 --threads 1
    ```
 
-4. Run normal batches:
+5. Run normal batches:
 
    ```bash
    python register.py run --preset stable
    ```
 
-5. Resume after interruption:
+6. Resume after interruption:
 
    ```bash
    python register.py resume
    ```
 
-6. Retry failed tasks only:
+7. Retry failed tasks only:
 
    ```bash
    python register.py retry-failed
    ```
 
-7. Export accounts:
+8. Export accounts:
 
    ```bash
    python register.py export --format txt
@@ -95,6 +120,8 @@ Batch progress is stored in `data/progress.db`.
 
 ## Stability Features
 
+- `gui.py` is a thin Tkinter wrapper around the same CLI commands, so GUI and
+  CLI behavior stay aligned.
 - Network-like failures are retried per task. Configure with
   `register.max_task_retries` and `register.retry_backoff_seconds`.
 - SQLite progress tracking records every task in `output.progress_db`.
