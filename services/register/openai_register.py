@@ -233,11 +233,11 @@ def log(text: str, color: str = "") -> None:
     with print_lock:
         prefix = colors.get(color, "")
         suffix = "\033[0m" if prefix else ""
-        print(f"{prefix}{datetime.now().strftime('%H:%M:%S')} {text}{suffix}")
+        print(f"{prefix}{datetime.now().strftime('%H:%M:%S')} {text}{suffix}", flush=True)
 
 
 def step(index: int, text: str, color: str = "") -> None:
-    log(f"[任务{index}] {text}", color)
+    log(f"[task{index}] {text}", color)
 
 
 def _make_trace_headers() -> dict[str, str]:
@@ -955,35 +955,6 @@ def _refresh_account_background(index: int, access_token: str) -> None:
     except Exception as error:
         record_refresh_metrics((time.monotonic() - started) * 1000, error)
         step(index, f"stage=account_refresh account status refresh failed in background: {error}", "yellow")
-
-
-def worker(index: int) -> dict:
-    start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
-    try:
-        step(index, "任务启动")
-        result = registrar.register(index)
-        cost = time.time() - start
-        access_token = str(result["access_token"])
-        account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
-        if refresh_result.get("errors"):
-            step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
-        with stats_lock:
-            stats["done"] += 1
-            stats["success"] += 1
-            avg = (time.time() - stats["start_time"]) / stats["success"]
-        log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
-        return {"ok": True, "index": index, "result": result}
-    except Exception as e:
-        cost = time.time() - start
-        with stats_lock:
-            stats["done"] += 1
-            stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
-        return {"ok": False, "index": index, "error": str(e)}
-    finally:
-        registrar.close()
 
 
 def worker(index: int) -> dict:
