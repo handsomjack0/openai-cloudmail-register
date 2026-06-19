@@ -217,6 +217,7 @@ email_pool_stop = threading.Event()
 email_pool_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 email_pool_threads: list[threading.Thread] = []
 email_pool_config: dict[str, Any] | None = None
+email_pool_low_watermark = 0
 
 
 def _config(mail_config: dict) -> dict:
@@ -1600,15 +1601,17 @@ def start_email_pool(
     mail_config: dict,
     target_size: int,
     workers: int = 1,
+    low_watermark: int = 0,
     log_callback: Callable[[str], None] | None = None,
 ) -> None:
     """Pre-create CloudMail mailboxes while preserving the existing provider API."""
-    global email_pool_config
+    global email_pool_config, email_pool_low_watermark
     target_size = max(0, int(target_size or 0))
     if target_size <= 0:
         stop_email_pool()
         clear_email_pool()
         return
+    low_watermark = max(0, min(int(low_watermark or 0), target_size - 1))
     enabled = _enabled_entries(mail_config)
     if len(enabled) != 1 or enabled[0].get("type") != "cloudmail_gen":
         if log_callback:
@@ -1616,6 +1619,7 @@ def start_email_pool(
         return
     with email_pool_lock:
         email_pool_config = dict(mail_config)
+        email_pool_low_watermark = low_watermark
         email_pool_stop.clear()
         live = [thread for thread in email_pool_threads if thread.is_alive()]
         email_pool_threads[:] = live
@@ -1634,7 +1638,8 @@ def start_email_pool(
 def _email_pool_worker(target_size: int, log_callback: Callable[[str], None] | None = None) -> None:
     while not email_pool_stop.is_set():
         try:
-            if email_pool_queue.qsize() >= target_size:
+            current_size = email_pool_queue.qsize()
+            if current_size >= target_size or (current_size > email_pool_low_watermark and current_size > 0):
                 time.sleep(0.5)
                 continue
             config_snapshot = dict(email_pool_config or {})

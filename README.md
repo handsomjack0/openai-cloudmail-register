@@ -15,16 +15,26 @@ Fill `config.json` with your local CloudMail and proxy settings. Do not commit
 ## Run
 
 ```bash
-python register.py --config config.json
+python register.py run --config config.json
 ```
 
-Overrides:
+Legacy mode still works:
 
 ```bash
-python register.py --total 20 --threads 2
-python register.py --proxy http://127.0.0.1:7890
-python register.py --check-config
-python register.py --resume
+python register.py --config config.json --total 20 --threads 2
+```
+
+Common commands:
+
+```bash
+python register.py doctor
+python register.py run --preset smoke
+python register.py run --preset stable
+python register.py run --preset fast
+python register.py resume
+python register.py retry-failed
+python register.py status
+python register.py export --format txt
 ```
 
 Successful accounts are appended to `data/accounts.jsonl`. Failed tasks are
@@ -36,32 +46,52 @@ Batch progress is stored in `data/progress.db`.
 1. Validate the config:
 
    ```bash
-   python register.py --check-config
+   python register.py doctor
    ```
 
 2. Run one account:
 
    ```bash
-   python register.py --total 1 --threads 1
+   python register.py run --preset smoke
    ```
 
 3. Run a small batch:
 
    ```bash
-   python register.py --total 5 --threads 1
+   python register.py run --total 5 --threads 1
    ```
 
 4. Run normal batches:
 
    ```bash
-   python register.py --total 20 --threads 2
+   python register.py run --preset stable
    ```
 
 5. Resume after interruption:
 
    ```bash
-   python register.py --resume
+   python register.py resume
    ```
+
+6. Retry failed tasks only:
+
+   ```bash
+   python register.py retry-failed
+   ```
+
+7. Export accounts:
+
+   ```bash
+   python register.py export --format txt
+   python register.py export --format csv
+   python register.py export --format jsonl
+   ```
+
+## Presets
+
+- `smoke`: `total=1`, `threads=1`, mailbox pool disabled.
+- `stable`: `total=20`, `threads=2`, mailbox pool size 10.
+- `fast`: `total=50`, `threads=4`, mailbox pool size 20.
 
 ## Stability Features
 
@@ -74,7 +104,11 @@ Batch progress is stored in `data/progress.db`.
   so workers can start registration faster. The pool only activates when the
   active provider is a single `cloudmail_gen`; other providers keep the original
   creation path. `register.email_pool_warmup_seconds` can wait briefly for the
-  first pooled mailbox before workers start.
+  first pooled mailbox before workers start. `register.email_pool_low_watermark`
+  controls when the pool starts refilling.
+- `status` reads `data/progress.db` and prints batch counts plus recent failures.
+- `retry-failed` reruns only failed tasks from the latest unfinished batch.
+- `export` converts `data/accounts.jsonl` into txt, csv, or jsonl output.
 
 ## Diagnostics
 

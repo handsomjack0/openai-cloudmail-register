@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sqlite3
 import sys
@@ -19,6 +20,11 @@ from services.register import mail_provider, openai_register
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 EXAMPLE_CONFIG = BASE_DIR / "config.example.json"
+PRESETS = {
+    "smoke": {"total": 1, "threads": 1, "email_pool_size": 0, "thread_start_interval": 0.0},
+    "stable": {"total": 20, "threads": 2, "email_pool_size": 10, "thread_start_interval": 0.8},
+    "fast": {"total": 50, "threads": 4, "email_pool_size": 20, "thread_start_interval": 1.0},
+}
 
 
 def _force_utf8_stdio() -> None:
@@ -56,18 +62,24 @@ def _resolve_path(value: str | Path, default: str) -> Path:
     return path
 
 
+def _arg(args: argparse.Namespace, name: str, default: Any = None) -> Any:
+    return getattr(args, name, default)
+
+
 def _build_register_config(raw: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Path]]:
     cloudmail = raw.get("cloudmail") if isinstance(raw.get("cloudmail"), dict) else {}
     register = raw.get("register") if isinstance(raw.get("register"), dict) else {}
     proxy_cfg = raw.get("proxy") if isinstance(raw.get("proxy"), dict) else {}
     output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
 
-    proxy_url = str(args.proxy if args.proxy is not None else proxy_cfg.get("url") or "").strip()
-    if proxy_cfg.get("enabled") is False and args.proxy is None:
+    preset = PRESETS.get(str(_arg(args, "preset", "") or "").strip().lower(), {})
+    proxy_override = _arg(args, "proxy", None)
+    proxy_url = str(proxy_override if proxy_override is not None else proxy_cfg.get("url") or "").strip()
+    if proxy_cfg.get("enabled") is False and proxy_override is None:
         proxy_url = ""
 
-    total = args.total if args.total is not None else register.get("total", 1)
-    threads = args.threads if args.threads is not None else register.get("threads", 1)
+    total = _arg(args, "total", None) if _arg(args, "total", None) is not None else preset.get("total", register.get("total", 1))
+    threads = _arg(args, "threads", None) if _arg(args, "threads", None) is not None else preset.get("threads", register.get("threads", 1))
 
     mail_conf = {
         "request_timeout": float(register.get("request_timeout") or 30),
@@ -100,11 +112,12 @@ def _build_register_config(raw: dict[str, Any], args: argparse.Namespace) -> tup
         "threads": max(1, int(threads or 1)),
         "otp_resend": str(register.get("otp_resend") or "after_delay").strip().lower(),
         "otp_resend_delay": max(0, int(float(register.get("otp_resend_delay") or 5))),
-        "thread_start_interval": max(0.0, float(register.get("thread_start_interval") or 0)),
+        "thread_start_interval": max(0.0, float(preset.get("thread_start_interval", register.get("thread_start_interval") or 0))),
         "auto_stop_on_consecutive_failures": max(0, int(register.get("auto_stop_on_consecutive_failures") or 0)),
         "max_task_retries": max(0, int(register.get("max_task_retries") or 0)),
         "retry_backoff_seconds": max(0.0, float(register.get("retry_backoff_seconds") or 2)),
-        "email_pool_size": max(0, int(register.get("email_pool_size") or 0)),
+        "email_pool_size": max(0, int(preset.get("email_pool_size", register.get("email_pool_size") or 0))),
+        "email_pool_low_watermark": max(0, int(register.get("email_pool_low_watermark") or 0)),
         "email_pool_workers": max(1, int(register.get("email_pool_workers") or 1)),
         "email_pool_warmup_seconds": max(0.0, float(register.get("email_pool_warmup_seconds") or 0)),
     }
@@ -212,9 +225,7 @@ class ProgressStore:
         return batch_id
 
     def resume_batch(self) -> str | None:
-        row = self.conn.execute(
-            "SELECT id FROM batches WHERE status != 'completed' ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+        row = self.conn.execute("SELECT id FROM batches WHERE status != 'completed' ORDER BY created_at DESC LIMIT 1").fetchone()
         if not row:
             return None
         batch_id = str(row[0])
@@ -227,12 +238,83 @@ class ProgressStore:
             )
         return batch_id
 
+    def latest_batch(self, include_completed: bool = True) -> str | None:
+        where = "" if include_completed else "WHERE status != 'completed'"
+        row = self.conn.execute(f"SELECT id FROM batches {where} ORDER BY created_at DESC LIMIT 1").fetchone()
+        return str(row[0]) if row else None
+
+    def latest_failed_batch(self) -> str | None:
+        row = self.conn.execute(
+            """
+            SELECT b.id
+            FROM batches b
+            JOIN tasks t ON t.batch_id = b.id
+            WHERE t.status = 'failed'
+            ORDER BY b.created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def batch_info(self, batch_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT id,total,status,created_at,updated_at FROM batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "id": str(row[0]),
+            "total": int(row[1]),
+            "status": str(row[2]),
+            "created_at": str(row[3]),
+            "updated_at": str(row[4]),
+        }
+
     def pending_indices(self, batch_id: str) -> list[int]:
         rows = self.conn.execute(
             "SELECT task_index FROM tasks WHERE batch_id=? AND status IN ('pending','failed') ORDER BY task_index",
             (batch_id,),
         ).fetchall()
         return [int(row[0]) for row in rows]
+
+    def failed_indices(self, batch_id: str) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT task_index FROM tasks WHERE batch_id=? AND status='failed' ORDER BY task_index",
+            (batch_id,),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def latest_failures(self, batch_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT task_index,error_stage,error_message,attempts,updated_at
+            FROM tasks
+            WHERE batch_id=? AND status='failed'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (batch_id, max(1, int(limit))),
+        ).fetchall()
+        return [
+            {
+                "index": int(row[0]),
+                "stage": str(row[1] or ""),
+                "error": str(row[2] or ""),
+                "attempts": int(row[3] or 0),
+                "updated_at": str(row[4] or ""),
+            }
+            for row in rows
+        ]
+
+    def reset_failed_to_pending(self, batch_id: str) -> None:
+        now = self._now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET status='pending', updated_at=? WHERE batch_id=? AND status='failed'",
+                (now, batch_id),
+            )
+            self.conn.execute("UPDATE batches SET status='running', updated_at=? WHERE id=?", (now, batch_id))
 
     def mark_running(self, batch_id: str, task_index: int) -> None:
         now = self._now()
@@ -321,7 +403,7 @@ def _worker_with_retries(index: int, max_retries: int, backoff_seconds: float) -
     return last
 
 
-def _run(cfg: dict[str, Any], paths: dict[str, Path], *, resume: bool = False) -> int:
+def _run(cfg: dict[str, Any], paths: dict[str, Path], *, resume: bool = False, retry_failed: bool = False) -> int:
     account_service.configure(paths["accounts_file"])
     _install_log_sink(paths["log_file"])
     openai_register.config.update(
@@ -347,6 +429,7 @@ def _run(cfg: dict[str, Any], paths: dict[str, Path], *, resume: bool = False) -
     completed = 0
     success = 0
     fail = 0
+    counts: dict[str, int] = {}
     progress = ProgressStore(paths["progress_db"])
 
     print(f"[runner] total={total} threads={threads} proxy={'on' if cfg['proxy'] else 'off'}")
@@ -357,17 +440,28 @@ def _run(cfg: dict[str, Any], paths: dict[str, Path], *, resume: bool = False) -
     print(f"[runner] retries={max_retries} email_pool={cfg['email_pool_size']}")
 
     try:
-        batch_id = progress.resume_batch() if resume else None
+        batch_id = progress.latest_failed_batch() if retry_failed else progress.resume_batch() if resume else None
+        retry_indices: list[int] = []
+        if retry_failed and batch_id:
+            retry_indices = progress.failed_indices(batch_id)
+            progress.reset_failed_to_pending(batch_id)
+        if retry_failed and not retry_indices:
+            print("[runner] no failed tasks to retry")
+            return 1
         if not batch_id:
             batch_id = progress.create_batch(total)
-        task_indices = progress.pending_indices(batch_id)
-        print(f"[runner] batch={batch_id} pending={len(task_indices)} resume={'yes' if resume else 'no'}")
+        task_indices = retry_indices if retry_failed else progress.pending_indices(batch_id)
+        print(
+            f"[runner] batch={batch_id} pending={len(task_indices)} "
+            f"resume={'yes' if resume else 'no'} retry_failed={'yes' if retry_failed else 'no'}"
+        )
 
         if cfg["email_pool_size"] > 0:
             mail_provider.start_email_pool(
                 cfg["mail"],
                 cfg["email_pool_size"],
                 cfg["email_pool_workers"],
+                low_watermark=cfg["email_pool_low_watermark"],
                 log_callback=lambda message: openai_register.log(f"[email_pool] {message}"),
             )
             warmup_deadline = time.monotonic() + float(cfg["email_pool_warmup_seconds"])
@@ -452,24 +546,216 @@ def _run(cfg: dict[str, Any], paths: dict[str, Path], *, resume: bool = False) -
     return 0 if fail == 0 and success > 0 else 1
 
 
-def main() -> int:
-    _force_utf8_stdio()
-    parser = argparse.ArgumentParser(description="Standalone CloudMail OpenAI register runner")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to config.json")
-    parser.add_argument("--total", type=int, default=None, help="Override register.total")
-    parser.add_argument("--threads", type=int, default=None, help="Override register.threads")
-    parser.add_argument("--proxy", default=None, help="Override proxy.url; pass an empty string for direct")
-    parser.add_argument("--check-config", action="store_true", help="Only load and validate config")
-    parser.add_argument("--resume", action="store_true", help="Resume the latest unfinished batch from progress.db")
-    args = parser.parse_args()
-
+def _load_runtime(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Path]]:
     raw = _load_json(Path(args.config))
     cfg, paths = _build_register_config(raw, args)
     _validate_config(cfg)
+    return cfg, paths
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    cfg, paths = _load_runtime(args)
     if args.check_config:
         print("[ok] config valid")
         return 0
-    return _run(cfg, paths, resume=args.resume)
+    return _run(cfg, paths)
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    cfg, paths = _load_runtime(args)
+    return _run(cfg, paths, resume=True)
+
+
+def _cmd_retry_failed(args: argparse.Namespace) -> int:
+    cfg, paths = _load_runtime(args)
+    return _run(cfg, paths, retry_failed=True)
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    cfg, paths = _load_runtime(args)
+    db_path = paths["progress_db"]
+    if not db_path.exists():
+        print(f"[status] no progress database: {db_path}")
+        return 1
+    store = ProgressStore(db_path)
+    try:
+        batch_id = args.batch or store.latest_batch(include_completed=True)
+        if not batch_id:
+            print("[status] no batches")
+            return 1
+        info = store.batch_info(batch_id)
+        if not info:
+            print(f"[status] batch not found: {batch_id}")
+            return 1
+        counts = store.counts(batch_id)
+        print(f"batch={info['id']}")
+        print(f"status={info['status']} total={info['total']} created_at={info['created_at']} updated_at={info['updated_at']}")
+        print("counts=" + json.dumps(counts, ensure_ascii=False))
+        failures = store.latest_failures(batch_id, limit=args.limit)
+        if failures:
+            print("latest_failures:")
+            for item in failures:
+                print(
+                    f"  #{item['index']} attempts={item['attempts']} "
+                    f"stage={item['stage']} error={item['error'][:180]}"
+                )
+        return 0
+    finally:
+        store.close()
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    ok = True
+    print(f"[doctor] python={sys.version.split()[0]}")
+    try:
+        import curl_cffi  # noqa: F401
+
+        print("[ok] curl_cffi installed")
+    except Exception as error:
+        print(f"[fail] curl_cffi import failed: {error}")
+        ok = False
+    try:
+        cfg, paths = _load_runtime(args)
+        print("[ok] config valid")
+        print(f"[info] proxy={'on' if cfg['proxy'] else 'off'}")
+        print(f"[info] progress_db={paths['progress_db']}")
+    except Exception as error:
+        print(f"[fail] config invalid: {error}")
+        return 1
+    try:
+        provider = mail_provider._create_provider(cfg["mail"])  # type: ignore[attr-defined]
+        try:
+            if getattr(provider, "name", "") == "cloudmail_gen" and hasattr(provider, "_get_token"):
+                token = provider._get_token()
+                print(f"[ok] CloudMail public token acquired: {str(token)[:6]}...")
+            else:
+                print(f"[skip] live CloudMail token check for provider={getattr(provider, 'name', 'unknown')}")
+        finally:
+            provider.close()
+    except Exception as error:
+        print(f"[fail] CloudMail live check failed: {error}")
+        ok = False
+    if args.create_mailbox:
+        try:
+            mailbox = mail_provider.create_mailbox(cfg["mail"])
+            print(f"[ok] mailbox created: {mailbox.get('address')}")
+        except Exception as error:
+            print(f"[fail] mailbox create failed: {error}")
+            ok = False
+    return 0 if ok else 1
+
+
+def _iter_accounts(path: Path) -> list[dict[str, Any]]:
+    accounts: list[dict[str, Any]] = []
+    if not path.exists():
+        return accounts
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            accounts.append(item)
+    return accounts
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    cfg, paths = _load_runtime(args)
+    accounts = _iter_accounts(paths["accounts_file"])
+    if not accounts:
+        print(f"[export] no accounts found: {paths['accounts_file']}")
+        return 1
+    output = Path(args.output) if args.output else BASE_DIR / "data" / f"accounts_export.{args.format}"
+    if not output.is_absolute():
+        output = BASE_DIR / output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if args.format == "jsonl":
+        with output.open("w", encoding="utf-8") as handle:
+            for item in accounts:
+                handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+    elif args.format == "csv":
+        fields = ["email", "password", "access_token", "refresh_token", "id_token", "created_at", "source_type"]
+        with output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for item in accounts:
+                writer.writerow({field: item.get(field, "") for field in fields})
+    else:
+        with output.open("w", encoding="utf-8") as handle:
+            for item in accounts:
+                handle.write(
+                    f"{item.get('email','')}----{item.get('password','')}----{item.get('refresh_token','')}\n"
+                )
+    print(f"[export] wrote {len(accounts)} accounts to {output}")
+    return 0
+
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to config.json")
+    parser.add_argument("--proxy", default=None, help="Override proxy.url; pass an empty string for direct")
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    _add_common_args(parser)
+    parser.add_argument("--total", type=int, default=None, help="Override register.total")
+    parser.add_argument("--threads", type=int, default=None, help="Override register.threads")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="", help="Use a built-in run preset")
+    parser.add_argument("--check-config", action="store_true", help="Only load and validate config")
+
+
+def _legacy_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Standalone CloudMail OpenAI register runner")
+    _add_run_args(parser)
+    parser.add_argument("--resume", action="store_true", help="Resume the latest unfinished batch from progress.db")
+    args = parser.parse_args(argv)
+    if args.resume:
+        return _cmd_resume(args)
+    return _cmd_run(args)
+
+
+def main() -> int:
+    _force_utf8_stdio()
+    commands = {"run", "resume", "status", "doctor", "export", "retry-failed"}
+    argv = sys.argv[1:]
+    if not argv or (argv[0] not in commands and argv[0] not in {"-h", "--help"}):
+        return _legacy_main(argv)
+
+    parser = argparse.ArgumentParser(description="Standalone CloudMail OpenAI register runner")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Start a new batch")
+    _add_run_args(run_parser)
+    run_parser.set_defaults(func=_cmd_run)
+
+    resume_parser = subparsers.add_parser("resume", help="Resume the latest unfinished batch")
+    _add_run_args(resume_parser)
+    resume_parser.set_defaults(func=_cmd_resume)
+
+    retry_parser = subparsers.add_parser("retry-failed", help="Retry failed tasks from the latest unfinished batch")
+    _add_run_args(retry_parser)
+    retry_parser.set_defaults(func=_cmd_retry_failed)
+
+    status_parser = subparsers.add_parser("status", help="Show progress from progress.db")
+    _add_common_args(status_parser)
+    status_parser.add_argument("--batch", default="", help="Batch id; defaults to latest")
+    status_parser.add_argument("--limit", type=int, default=5, help="Number of recent failures to show")
+    status_parser.set_defaults(func=_cmd_status)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check local dependencies and CloudMail connectivity")
+    _add_common_args(doctor_parser)
+    doctor_parser.add_argument("--create-mailbox", action="store_true", help="Also create a test mailbox")
+    doctor_parser.set_defaults(func=_cmd_doctor)
+
+    export_parser = subparsers.add_parser("export", help="Export accounts from accounts.jsonl")
+    _add_common_args(export_parser)
+    export_parser.add_argument("--format", choices=("txt", "csv", "jsonl"), default="txt")
+    export_parser.add_argument("--output", default="", help="Output path")
+    export_parser.set_defaults(func=_cmd_export)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":

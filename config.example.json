@@ -15,6 +15,7 @@
     "max_task_retries": 2,
     "retry_backoff_seconds": 2,
     "email_pool_size": 10,
+    "email_pool_low_watermark": 3,
     "email_pool_workers": 1,
     "email_pool_warmup_seconds": 3,
     "otp_timeout": 60,

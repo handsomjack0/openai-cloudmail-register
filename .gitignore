@@ -10,10 +10,11 @@ config.local.json
 data/*.json
 data/*.jsonl
 data/*.db
+data/*.txt
+data/*.csv
 accounts_*.txt
 failed_*.txt
 mail_credentials.txt
 
 logs/
 tmp/
-
