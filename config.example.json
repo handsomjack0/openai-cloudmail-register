@@ -1,0 +1,33 @@
+{
+  "cloudmail": {
+    "api_base": "",
+    "admin_email": "",
+    "admin_password": "",
+    "domains": [],
+    "email_prefix": "",
+    "auto_add_account": true,
+    "account_add_token": ""
+  },
+  "register": {
+    "total": 5,
+    "threads": 1,
+    "thread_start_interval": 0.8,
+    "otp_timeout": 60,
+    "otp_fast_poll_seconds": 10,
+    "otp_fast_poll_interval": 0.8,
+    "otp_normal_poll_interval": 2,
+    "otp_resend": "after_delay",
+    "otp_resend_delay": 5,
+    "auto_stop_on_consecutive_failures": 10
+  },
+  "proxy": {
+    "enabled": false,
+    "url": ""
+  },
+  "output": {
+    "accounts_file": "data/accounts.jsonl",
+    "failed_file": "data/failed.jsonl",
+    "log_file": "logs/register.log"
+  }
+}
+
